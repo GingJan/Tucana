@@ -44,7 +44,7 @@ type tCache struct {
 	defaultExpireIn time.Duration //默认缓存时间
 	m               *manager
 	localCache      *localCache.Cache
-	rds             redis.Conn
+	rds             *redis.Pool
 
 	keyCaches map[string]keyCache //map[key]keyCache
 	watchC    chan alteration     //key值变动的通知channel
@@ -55,7 +55,7 @@ type keyCache struct {
 	sf       singleflight.Group
 }
 
-func New(rds redis.Conn, options ...Option) *tCache {
+func New(rdsPool *redis.Pool, options ...Option) *tCache {
 	if mgr == nil {
 		panic("Init first")
 	}
@@ -73,7 +73,7 @@ func New(rds redis.Conn, options ...Option) *tCache {
 		option:     option,
 		m:          mgr.manager,
 		localCache: localCache.New(1*time.Minute, 5*time.Minute),
-		rds:        rds,
+		rds:        rdsPool,
 		keyCaches:  make(map[string]keyCache),
 		watchC:     watchC,
 	}
@@ -276,9 +276,9 @@ func (t *tCache) getLocal(key string) ([]byte, bool) {
 func (t *tCache) setRemote(key string, data []byte, expireIn time.Duration, isForce bool) (ok bool, err error) {
 	var ret string
 	if isForce {
-		ret, err = redis.String(t.rds.Do("SET", key, data, "PX", expireIn.Nanoseconds()/1e6))
+		ret, err = redis.String(t.rds.Get().Do("SET", key, data, "PX", expireIn.Nanoseconds()/1e6))
 	} else {
-		ret, err = redis.String(t.rds.Do("SET", key, data, "NX", "PX", expireIn.Nanoseconds()/1e6))
+		ret, err = redis.String(t.rds.Get().Do("SET", key, data, "NX", "PX", expireIn.Nanoseconds()/1e6))
 	}
 
 	if err != nil {
@@ -296,7 +296,7 @@ func (t *tCache) getRemote(key string) ([]byte, bool, error) {
 	//}
 
 	//remote mem, the cache for the second layer
-	raw, err := redis.Bytes(t.rds.Do("GET", key))
+	raw, err := redis.Bytes(t.rds.Get().Do("GET", key))
 	if err != nil {
 		return nil, false, err
 	}
@@ -325,7 +325,7 @@ func (t *tCache) purgeLocal(key string) {
 }
 
 func (t *tCache) purgeRemote(key string) {
-	_, e := t.rds.Do("DEL", key)
+	_, e := t.rds.Get().Do("DEL", key)
 	if e != nil {
 		fmt.Printf("purgeRemote key=%s, err=%s", key, e)
 	}
