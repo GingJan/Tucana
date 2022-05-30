@@ -40,22 +40,20 @@ type CacheOption struct {
 
 //缓存对象
 type tCache struct {
-	option          *CacheOption
-	defaultExpireIn time.Duration //默认缓存时间
-	m               *manager
-	localCache      *localCache.Cache
-	rds             *redis.Pool
+	option     *CacheOption
+	m          *manager
+	localCache *localCache.Cache
 
-	keyCaches map[string]keyCache //map[key]keyCache
-	watchC    chan alteration     //key值变动的通知channel
+	keysExpireIn map[string]time.Duration //map[key]expireIn TODO 定时删除
+	watchC       chan alteration          //key值变动的通知channel
+	sf           singleflight.Group
 }
 type keyCache struct {
 	// key expire in
 	expireIn time.Duration
-	sf       singleflight.Group
 }
 
-func New(rdsPool *redis.Pool, options ...Option) *tCache {
+func New(options ...Option) *tCache {
 	if mgr == nil {
 		panic("Init first")
 	}
@@ -70,12 +68,11 @@ func New(rdsPool *redis.Pool, options ...Option) *tCache {
 	}
 
 	tc := &tCache{
-		option:     option,
-		m:          mgr.manager,
-		localCache: localCache.New(1*time.Minute, 5*time.Minute),
-		rds:        rdsPool,
-		keyCaches:  make(map[string]keyCache),
-		watchC:     watchC,
+		option:       option,
+		m:            mgr.manager,
+		localCache:   localCache.New(1*time.Minute, 5*time.Minute),
+		keysExpireIn: make(map[string]time.Duration),
+		watchC:       watchC,
 	}
 
 	for _, o := range options {
@@ -106,18 +103,18 @@ func WithOptions(o CacheOption) Option {
 
 //Storing data into cache
 func (t *tCache) store(key string, bdata []byte, layer int) error {
-	keyCache, ok := t.keyCaches[key]
+	expireIn, ok := t.keysExpireIn[key]
 	if !ok {
 		return fmt.Errorf("unexists info for key=%s", key)
 	}
 
-	expireIn := keyCache.expireIn
 	if t.isNil(bdata) {
 		expireIn = t.option.DefaultExpireIn
 	}
 	switch layer {
 	case layerLocal:
-		return t.setLocal(key, bdata, expireIn)
+		t.setLocal(key, bdata, expireIn)
+		return nil
 	case layerRemote:
 		//just one shot, ignore it if failed
 		_, err := t.setRemote(key, bdata, expireIn, false)
@@ -129,7 +126,8 @@ func (t *tCache) store(key string, bdata []byte, layer int) error {
 		}
 		//setting local cache if remote cache was set
 		if ok {
-			return t.setLocal(key, bdata, expireIn)
+			t.setLocal(key, bdata, expireIn)
+			return nil
 		}
 	}
 
@@ -159,18 +157,13 @@ func (t *tCache) nil() []byte {
 }
 
 // load Fetching data from source and fill it into cache
-func (t *tCache) load(key string, fetcher Fetcher, layer int) ([]byte, bool, error) {
-	keyCache, ok := t.keyCaches[key]
-	if !ok {
-		return t.nil(), false, fmt.Errorf("unexists info for key=%s", key)
-	}
-
+func (t *tCache) load(key string, fetcher Fetcher) ([]byte, bool, error) {
 	//fetch data from datasource
 	//singleflight 防止数据源被压垮
 	//从数据源拉取数据
-	data, err, _ := keyCache.sf.Do(key, func() (interface{}, error) {
+	data, err, _ := t.sf.Do(key, func() (interface{}, error) {
 		//在本次读取新数据时，把上一次的旧数据清除，节约内存
-		keyCache.sf.Forget(key)
+		t.sf.Forget(key)
 		data, isNil, err := t.pull(fetcher)
 		if err != nil {
 			return t.nil(), err
@@ -224,12 +217,10 @@ func (t *tCache) getCascade(key string, layer int, fresh bool) (bdata []byte, ok
 
 			if fresh {
 				//更新本地缓存
-				keyCache, ok2 := t.keyCaches[key]
-				if !ok2 {
-					return t.nil(), false, fmt.Errorf("unexists info for key=%s", key)
+				expireIn, ok := t.keysExpireIn[key]
+				if ok {
+					t.setLocal(key, bdata, expireIn)
 				}
-
-				err = t.setLocal(key, bdata, keyCache.expireIn)
 			}
 
 			return bdata, ok, err
@@ -241,11 +232,11 @@ func (t *tCache) getCascade(key string, layer int, fresh bool) (bdata []byte, ok
 
 //设置本地缓存
 // setLocal Setting local cache
-func (t *tCache) setLocal(key string, obj interface{}, expireIn time.Duration) error {
+func (t *tCache) setLocal(key string, obj interface{}, expireIn time.Duration) {
 	switch obj.(type) {
 	case []byte:
 		t.localCache.Set(key, obj.([]byte), expireIn)
-		return nil
+		return
 	}
 
 	//w := &bytes.Buffer{}
@@ -259,7 +250,7 @@ func (t *tCache) setLocal(key string, obj interface{}, expireIn time.Duration) e
 
 	bdata, _ := t.option.JsonParser.Marshal(obj)
 	t.localCache.Set(key, bdata, expireIn)
-	return nil
+	return
 }
 
 func (t *tCache) getLocal(key string) ([]byte, bool) {
@@ -276,9 +267,9 @@ func (t *tCache) getLocal(key string) ([]byte, bool) {
 func (t *tCache) setRemote(key string, data []byte, expireIn time.Duration, isForce bool) (ok bool, err error) {
 	var ret string
 	if isForce {
-		ret, err = redis.String(t.rds.Get().Do("SET", key, data, "PX", expireIn.Nanoseconds()/1e6))
+		ret, err = redis.String(t.m.rdsPool.Get().Do("SET", key, data, "PX", expireIn.Nanoseconds()/1e6))
 	} else {
-		ret, err = redis.String(t.rds.Get().Do("SET", key, data, "NX", "PX", expireIn.Nanoseconds()/1e6))
+		ret, err = redis.String(t.m.rdsPool.Get().Do("SET", key, data, "NX", "PX", expireIn.Nanoseconds()/1e6))
 	}
 
 	if err != nil {
@@ -296,7 +287,7 @@ func (t *tCache) getRemote(key string) ([]byte, bool, error) {
 	//}
 
 	//remote mem, the cache for the second layer
-	raw, err := redis.Bytes(t.rds.Get().Do("GET", key))
+	raw, err := redis.Bytes(t.m.rdsPool.Get().Do("GET", key))
 	if err != nil {
 		return nil, false, err
 	}
@@ -325,7 +316,7 @@ func (t *tCache) purgeLocal(key string) {
 }
 
 func (t *tCache) purgeRemote(key string) {
-	_, e := t.rds.Get().Do("DEL", key)
+	_, e := t.m.rdsPool.Get().Do("DEL", key)
 	if e != nil {
 		fmt.Printf("purgeRemote key=%s, err=%s", key, e)
 	}
@@ -371,11 +362,8 @@ func (t *tCache) StoreBoth(key string, bdata []byte) error {
 }
 
 func (t *tCache) Get(key string, fetcher Fetcher, expireIn time.Duration) ([]byte, bool, error) {
-	if _, ok := t.keyCaches[key]; !ok {
-		t.keyCaches[key] = keyCache{
-			sf:       singleflight.Group{},
-			expireIn: expireIn,
-		}
+	if _, ok := t.keysExpireIn[key]; !ok {
+		t.keysExpireIn[key] = expireIn
 	}
 
 	//级联获取
@@ -388,12 +376,12 @@ func (t *tCache) Get(key string, fetcher Fetcher, expireIn time.Duration) ([]byt
 	}
 
 	//loading data from src
-	data, ok, err = t.load(key, fetcher, t.option.Layer)
+	data, ok, err = t.load(key, fetcher)
 	if err != nil || !ok {
 		return nil, false, err
 	}
 
-	t.StoreBoth(key, data)
+	t.store(key, data, t.option.Layer)
 
 	return data, true, nil
 }

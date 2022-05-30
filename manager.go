@@ -14,8 +14,8 @@ type TCache struct {
 }
 
 // Init The id parameter represents the identifier of caller
-func Init(id string, rds redis.Conn) {
-	m := newManager(id, rds)
+func Init(id string, rdsPool *redis.Pool) {
+	m := newManager(id, rdsPool)
 	mgr = &TCache{m}
 	runWatching(m)
 	runtime.SetFinalizer(mgr, stopWatching)
@@ -24,7 +24,7 @@ func Init(id string, rds redis.Conn) {
 //manager 负责维护rds连接，pubsub订阅，监控key值变更，以及通过channel下发通知给其他cache对象
 type manager struct {
 	id         string
-	rds        redis.Conn
+	rdsPool    *redis.Pool
 	pubSubConn redis.PubSubConn //pubsub会占一条连接
 
 	subChans []chan alteration
@@ -38,11 +38,11 @@ type alteration struct {
 	key  string
 }
 
-func newManager(id string, rds redis.Conn) *manager {
+func newManager(id string, rdsPool *redis.Pool) *manager {
 	return &manager{
 		id:         id,
-		rds:        rds,
-		pubSubConn: redis.PubSubConn{Conn: rds},
+		rdsPool:    rdsPool,
+		pubSubConn: redis.PubSubConn{Conn: rdsPool.Get()},
 		subChans:   make([]chan alteration, 0),
 		watcher:    nil,
 	}
@@ -68,6 +68,6 @@ func (m *manager) getKeyAndOperation(channelName string) alteration {
 // NotifyUpdating Notify the local cache on the other machines that the value of the key has changed
 func (m *manager) NotifyUpdating(key string) error {
 	//通知redis（发布订阅），更新local 和 redis 缓存
-	_, err := m.rds.Do("PUBLISH", m.getChannelName(), fmt.Sprintf(chanMessageFormat, key, commandDel))
+	_, err := m.rdsPool.Get().Do("PUBLISH", m.getChannelName(), fmt.Sprintf(chanMessageFormat, key, commandDel))
 	return err
 }

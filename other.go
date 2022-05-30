@@ -23,7 +23,7 @@ func NewRedisPool(server, password string, maxIdle, idleTimeout, maxActive int, 
 			if err != nil {
 				return nil, err
 			}
-			if password != "" {
+			if len(password) != 0 {
 				if _, err := c.Do("AUTH", password); err != nil {
 					c.Close()
 					return nil, err

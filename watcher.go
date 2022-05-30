@@ -51,28 +51,28 @@ func (w *watcher) Run(m *manager) {
 			if err := m.pubSubConn.Ping(tmd); err != nil {
 				log.Printf("watch ping time=%s, err=%s", tm.Format("2006-01-02 15:04:05"), err)
 			}
-		}
+		default:
+			fmt.Println("blocking？")
+			switch v := m.pubSubConn.ReceiveWithTimeout(1 * time.Second).(type) {
+			case redis.Message:
+				fmt.Printf("%s: message: %s\n", v.Channel, v.Data)
 
-		fmt.Println("blocking？")
-		switch v := m.pubSubConn.ReceiveWithTimeout(0).(type) {
-		case redis.Message:
-			fmt.Printf("%s: message: %s\n", v.Channel, v.Data)
+				if v.Channel != m.getChannelName() {
+					continue
+				}
 
-			if v.Channel != m.getChannelName() {
-				continue
+				alteration := m.getKeyAndOperation(string(v.Data))
+				for _, c := range m.subChans {
+					c <- alteration
+				}
+
+			case redis.Pong:
+				nowUnix := time.Now().UnixNano()
+				at, _ := strconv.ParseInt(v.Data, 10, 64)
+				fmt.Printf("ping at=%d, now=%d, diff=%d", at, nowUnix, nowUnix-at)
+			case error:
+				fmt.Printf("Run err=%s", v)
 			}
-
-			alteration := m.getKeyAndOperation(string(v.Data))
-			for _, c := range m.subChans {
-				c <- alteration
-			}
-
-		case redis.Pong:
-			nowUnix := time.Now().UnixNano()
-			at, _ := strconv.ParseInt(v.Data, 10, 64)
-			fmt.Printf("ping at=%d, now=%d, diff=%d", at, nowUnix, nowUnix-at)
-		case error:
-			fmt.Printf("Run err=%s", v)
 		}
 	}
 }
