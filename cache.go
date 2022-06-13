@@ -30,7 +30,13 @@ const (
 
 var empty = []byte("_n")
 
-type Fetcher func() (cachedContent []byte, isEmpty bool, err error)
+type fetcher struct {
+	fetchFunc fetchFunc
+	key       string
+	tc        *tCache
+}
+
+type fetchFunc func() (cachedContent []byte, isEmpty bool, err error)
 
 type CacheOption struct {
 	JsonParser      jsoniter.API
@@ -44,43 +50,40 @@ type tCache struct {
 	m          *manager
 	localCache *localCache.Cache
 
-	keysExpireIn map[string]time.Duration //map[key]expireIn TODO 定时删除
-	watchC       chan alteration          //key值变动的通知channel
-	sf           singleflight.Group
-}
-type keyCache struct {
-	// key expire in
-	expireIn time.Duration
+	fetcher fetchFunc
+	watchC  chan alteration //key值变动的通知channel
+	sf      singleflight.Group
+
+	tag string
 }
 
-func New(options ...Option) *tCache {
+func New(tag string, a ...interface{}) *tCache {
 	if mgr == nil {
 		panic("Init first")
 	}
 
-	watchC := make(chan alteration, 10)
-	mgr.register(watchC) ////注册cache的通知channel
-
-	option := &CacheOption{
-		JsonParser:      jsoniter.ConfigCompatibleWithStandardLibrary,
-		Layer:           layerLocal,
-		DefaultExpireIn: defaultExpireIn,
-	}
-
 	tc := &tCache{
-		option:       option,
-		m:            mgr.manager,
-		localCache:   localCache.New(1*time.Minute, 5*time.Minute),
-		keysExpireIn: make(map[string]time.Duration),
-		watchC:       watchC,
-	}
-
-	for _, o := range options {
-		o(tc)
+		option: &CacheOption{
+			JsonParser:      jsoniter.ConfigCompatibleWithStandardLibrary,
+			Layer:           layerLocal,
+			DefaultExpireIn: defaultExpireIn,
+		},
+		m:          mgr.manager,
+		localCache: localCache.New(1*time.Minute, 5*time.Minute),
+		watchC:     make(chan alteration, 10),
 	}
 
 	go tc.watch()
+
+	mgr.registerWatch(tc.watchC) ////注册cache的通知channel
+
 	return tc
+}
+
+func (t *tCache) WithOptions(options ...Option) {
+	for _, o := range options {
+		o(t)
+	}
 }
 
 func WithDefaultExpireIn(In time.Duration) Option {
@@ -103,14 +106,8 @@ func WithOptions(o CacheOption) Option {
 
 //Storing data into cache
 func (t *tCache) store(key string, bdata []byte, layer int) error {
-	expireIn, ok := t.keysExpireIn[key]
-	if !ok {
-		return fmt.Errorf("unexists info for key=%s", key)
-	}
+	expireIn := t.option.DefaultExpireIn
 
-	if t.isNil(bdata) {
-		expireIn = t.option.DefaultExpireIn
-	}
 	switch layer {
 	case layerLocal:
 		t.setLocal(key, bdata, expireIn)
@@ -135,7 +132,7 @@ func (t *tCache) store(key string, bdata []byte, layer int) error {
 }
 
 //Fetching data from Fetcher
-func (t *tCache) pull(fetcher Fetcher) (interface{}, bool, error) {
+func (t *tCache) pull(fetcher fetchFunc) (interface{}, bool, error) {
 	data, isNil, err := fetcher()
 	if err != nil {
 		return nil, false, err
@@ -157,7 +154,7 @@ func (t *tCache) nil() []byte {
 }
 
 // load Fetching data from source and fill it into cache
-func (t *tCache) load(key string, fetcher Fetcher) ([]byte, bool, error) {
+func (t *tCache) load(key string, fetcher fetchFunc) ([]byte, bool, error) {
 	//fetch data from datasource
 	//singleflight 防止数据源被压垮
 	//从数据源拉取数据
@@ -217,10 +214,7 @@ func (t *tCache) getCascade(key string, layer int, fresh bool) (bdata []byte, ok
 
 			if fresh {
 				//更新本地缓存
-				expireIn, ok := t.keysExpireIn[key]
-				if ok {
-					t.setLocal(key, bdata, expireIn)
-				}
+				t.setLocal(key, bdata, t.option.DefaultExpireIn)
 			}
 
 			return bdata, ok, err
@@ -361,11 +355,7 @@ func (t *tCache) StoreBoth(key string, bdata []byte) error {
 	return t.store(key, bdata, layerLocal|layerRemote)
 }
 
-func (t *tCache) Get(key string, fetcher Fetcher, expireIn time.Duration) ([]byte, bool, error) {
-	if _, ok := t.keysExpireIn[key]; !ok {
-		t.keysExpireIn[key] = expireIn
-	}
-
+func (t *tCache) GetOrFetch(key string, fetcher fetchFunc, expireIn time.Duration) ([]byte, bool, error) {
 	//级联获取
 	data, ok, err := t.getCascade(key, t.option.Layer, true)
 	if err != nil {
@@ -384,4 +374,111 @@ func (t *tCache) Get(key string, fetcher Fetcher, expireIn time.Duration) ([]byt
 	t.store(key, data, t.option.Layer)
 
 	return data, true, nil
+}
+
+func (t *tCache) Get(argus ...interface{}) *tagCache {
+	return &tagCache{
+		l:   fromCache,
+		key: fmt.Sprintf(t.tag, argus...),
+		t:   t,
+	}
+}
+
+func (t *tCache) OrFetch(fetcher fetchFunc) *tagCache {
+	t.fetcher = fetcher
+	return &tagCache{
+		l:   fromSrc,
+		key: "",
+		t:   t,
+	}
+}
+
+const (
+	fromCache = 1
+	fromSrc   = 2
+)
+
+type tagCache struct {
+	t   *tCache
+	l   int
+	key string
+}
+
+func (tc *tagCache) Get(argus ...interface{}) *tagCache {
+	tc.l |= fromCache
+	if len(argus) != 0 {
+		tc.key = fmt.Sprintf(tc.t.tag, argus...)
+	}
+
+	return tc
+}
+
+func (tc *tagCache) OrFetch(fetcher fetchFunc) *tagCache {
+	tc.l |= fromSrc
+	tc.t.fetcher = fetcher
+	return tc
+}
+
+func (tc *tagCache) Do(argus ...interface{}) ([]byte, bool, error) {
+	if len(argus) != 0 {
+		tc.key = fmt.Sprintf(tc.t.tag, argus...)
+	}
+
+	if !tc.isValidKey() {
+		return []byte{}, false, fmt.Errorf("key empty")
+	}
+
+	switch tc.l {
+	case fromCache:
+		return tc.get()
+	case fromSrc:
+		data, ok, err := tc.load()
+		if err == nil {
+			tc.t.store(tc.key, data, tc.t.option.Layer)
+		}
+		return data, ok, err
+	case fromCache | fromSrc:
+		data, ok, err := tc.get()
+		if !ok {
+			data, ok, err = tc.load()
+			if err == nil {
+				tc.t.store(tc.key, data, tc.t.option.Layer)
+			}
+		}
+
+		return data, ok, err
+	}
+
+	return []byte{}, false, nil
+}
+
+func (tc *tagCache) load() ([]byte, bool, error) {
+	//loading data from src
+	if tc.t.fetcher == nil {
+		return []byte{}, false, nil
+	}
+
+	data, ok, err := tc.t.load(tc.key, tc.t.fetcher)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+
+	return data, true, nil
+}
+
+func (tc *tagCache) get() ([]byte, bool, error) {
+	//级联获取
+	data, ok, err := tc.t.getCascade(tc.key, tc.t.option.Layer, true)
+	if err != nil {
+		return nil, false, err
+	}
+	if ok {
+		return data, true, nil
+	}
+
+	return []byte{}, false, nil
+}
+
+func (tc *tagCache) isValidKey() bool {
+	return len(tc.key) != 0
 }

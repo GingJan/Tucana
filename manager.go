@@ -27,7 +27,7 @@ type manager struct {
 	rdsPool    *redis.Pool
 	pubSubConn redis.PubSubConn //pubsub会占一条连接
 
-	subChans []chan alteration
+	watchCs []chan alteration
 
 	watcher *watcher
 }
@@ -43,14 +43,14 @@ func newManager(id string, rdsPool *redis.Pool) *manager {
 		id:         id,
 		rdsPool:    rdsPool,
 		pubSubConn: redis.PubSubConn{Conn: rdsPool.Get()},
-		subChans:   make([]chan alteration, 0),
+		watchCs:    make([]chan alteration, 0),
 		watcher:    nil,
 	}
 }
 
 //注册cache的通知channel
-func (m *manager) register(wc chan alteration) {
-	m.subChans = append(m.subChans, wc)
+func (m *manager) registerWatch(wc chan alteration) {
+	m.watchCs = append(m.watchCs, wc)
 }
 
 func (m *manager) getChannelName() string {

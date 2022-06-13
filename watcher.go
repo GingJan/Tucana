@@ -41,8 +41,8 @@ func (w *watcher) Run(m *manager) {
 	for {
 		select {
 		case <-w.stop:
-			for _, c := range m.subChans {
-				close(c)
+			for _, wc := range m.watchCs {
+				close(wc)
 			}
 		case tm := <-ticker.C:
 			//TODO 判断是否有subscribe channel
@@ -62,7 +62,7 @@ func (w *watcher) Run(m *manager) {
 				}
 
 				alteration := m.getKeyAndOperation(string(v.Data))
-				for _, c := range m.subChans {
+				for _, c := range m.watchCs {
 					c <- alteration
 				}
 
@@ -71,6 +71,7 @@ func (w *watcher) Run(m *manager) {
 				at, _ := strconv.ParseInt(v.Data, 10, 64)
 				fmt.Printf("ping at=%d, now=%d, diff=%d", at, nowUnix, nowUnix-at)
 			case error:
+				fmt.Println(fmt.Sprintf("%#v", v))
 				fmt.Printf("Run err=%s", v)
 			}
 		}
