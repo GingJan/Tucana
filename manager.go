@@ -40,11 +40,10 @@ type alteration struct {
 
 func newManager(id string, rdsPool *redis.Pool) *manager {
 	return &manager{
-		id:         id,
-		rdsPool:    rdsPool,
-		pubSubConn: redis.PubSubConn{Conn: rdsPool.Get()},
-		watchCs:    make([]chan alteration, 0),
-		watcher:    nil,
+		id:      id,
+		rdsPool: rdsPool,
+		watchCs: make([]chan alteration, 0),
+		watcher: nil,
 	}
 }
 
@@ -57,17 +56,24 @@ func (m *manager) getChannelName() string {
 	return fmt.Sprintf(updatingChanName, m.id)
 }
 
-func (m *manager) getKeyAndOperation(channelName string) alteration {
+func (m *manager) getKeyAndOperation(channelName string) (alteration, error) {
 	s := strings.Split(channelName, "|")
+	if len(s) != 2 {
+		return alteration{}, fmt.Errorf("invaild msg")
+	}
 	return alteration{
 		oper: operation(s[1]),
 		key:  s[0],
-	}
+	}, nil
+}
+
+func (m *manager) blowWhistle(key string) error {
+	//通知redis（发布订阅），更新local 和 redis 缓存
+	_, err := m.rdsPool.Get().Do("PUBLISH", m.getChannelName(), fmt.Sprintf(chanMessageFormat, key, commandDel))
+	return err
 }
 
 // NotifyUpdating Notify the local cache on the other machines that the value of the key has changed
 func (m *manager) NotifyUpdating(key string) error {
-	//通知redis（发布订阅），更新local 和 redis 缓存
-	_, err := m.rdsPool.Get().Do("PUBLISH", m.getChannelName(), fmt.Sprintf(chanMessageFormat, key, commandDel))
-	return err
+	return m.blowWhistle(key)
 }

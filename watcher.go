@@ -9,6 +9,7 @@ import (
 )
 
 type watcher struct {
+	m        *manager
 	interval time.Duration
 	stop     chan struct{}
 	err      error
@@ -17,63 +18,110 @@ type watcher struct {
 //创建并运行watcher，监控key值变化
 func runWatching(m *manager) {
 	w := &watcher{
-		interval: 1 * time.Second,
+		m:        m,
+		interval: 30 * time.Second,
 		stop:     make(chan struct{}),
 	}
 
-	// first, we need to subscribe to the channel
-	w.err = m.pubSubConn.Subscribe(m.getChannelName())
 	m.watcher = w
-
 	// then run the watching task
-	go w.Run(m)
+	go w.Run()
 }
 
 func stopWatching(c *TCache) {
-	c.watcher.stop <- struct{}{}
+	c.manager.watcher.Close()
+}
+
+func (w *watcher) letsPing(t time.Time) {
+	tmd := strconv.FormatInt(t.UnixNano(), 10)
+	if err := w.m.pubSubConn.Ping(tmd); err != nil {
+		log.Printf("send ping at=%s, err=%s", t.Format("2006-01-02 15:04:05"), err)
+	}
+
+	return
 }
 
 // Run Watching all keys in local cache and update it if the key's value has changed
-func (w *watcher) Run(m *manager) {
+func (w *watcher) Run() {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
+
+	// subscribe to the channel first.
+	w.stare()
+
+	go func() {
+		for {
+			select {
+			case <-w.stop:
+				w.shutdown()
+			case tm := <-ticker.C:
+				//TODO 判断是否有subscribe channel
+				w.letsPing(tm)
+			}
+		}
+	}()
 
 	for {
 		select {
 		case <-w.stop:
-			for _, wc := range m.watchCs {
-				close(wc)
-			}
-		case tm := <-ticker.C:
-			//TODO 判断是否有subscribe channel
-
-			tmd := strconv.FormatInt(tm.UnixNano(), 10)
-			if err := m.pubSubConn.Ping(tmd); err != nil {
-				log.Printf("watch ping time=%s, err=%s", tm.Format("2006-01-02 15:04:05"), err)
-			}
+			w.shutdown()
 		default:
-			fmt.Println("blocking？")
-			switch v := m.pubSubConn.ReceiveWithTimeout(1 * time.Second).(type) {
+			switch v := w.m.pubSubConn.ReceiveWithTimeout(60 * time.Second).(type) {
+			case redis.Subscription:
+				fmt.Println(fmt.Sprintf("tucana has %sd channel", v.Kind, v.Channel))
 			case redis.Message:
-				fmt.Printf("%s: message: %s\n", v.Channel, v.Data)
+				fmt.Println(fmt.Sprintf("%s: message: %s\n", v.Channel, v.Data))
 
-				if v.Channel != m.getChannelName() {
+				if v.Channel != w.m.getChannelName() {
 					continue
 				}
 
-				alteration := m.getKeyAndOperation(string(v.Data))
-				for _, c := range m.watchCs {
+				alteration, err := w.m.getKeyAndOperation(string(v.Data))
+				if err != nil {
+					continue
+				}
+
+				for _, c := range w.m.watchCs {
 					c <- alteration
 				}
 
 			case redis.Pong:
 				nowUnix := time.Now().UnixNano()
 				at, _ := strconv.ParseInt(v.Data, 10, 64)
-				fmt.Printf("ping at=%d, now=%d, diff=%d", at, nowUnix, nowUnix-at)
+				fmt.Println(fmt.Sprintf("ping deferred=%dms", (nowUnix-at)/1e6))
+
 			case error:
-				fmt.Println(fmt.Sprintf("%#v", v))
-				fmt.Printf("Run err=%s", v)
+				//closing old conn
+				w.release()
+
+				//opening new conn
+				w.stare()
 			}
 		}
+	}
+}
+
+func (w *watcher) stare() {
+	w.m.pubSubConn = redis.PubSubConn{Conn: w.m.rdsPool.Get()}
+	w.err = w.m.pubSubConn.Subscribe(w.m.getChannelName())
+}
+
+func (w *watcher) Close() {
+	close(w.stop)
+}
+
+func (w *watcher) release() {
+	//closing conn
+	w.m.pubSubConn.Unsubscribe(w.m.getChannelName())
+	w.m.pubSubConn.Close()
+}
+
+func (w *watcher) shutdown() {
+	//closing conn
+	w.release()
+
+	//closing all the tag cacher's chan
+	for _, wc := range w.m.watchCs {
+		close(wc)
 	}
 }

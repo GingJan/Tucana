@@ -31,11 +31,11 @@ func NewRedisPool(server, password string, maxIdle, idleTimeout, maxActive int, 
 			}
 			return c, err
 		},
-		TestOnBorrow: func(c redis.Conn, t time.Time) error {
+		TestOnBorrow: func(c redis.Conn, t time.Time) error { //c要测试活性的连接，t该连接返还给连接池的时间
 			if time.Since(t) < time.Minute {
 				return nil
 			}
-			_, err := c.Do("PING")
+			_, err := c.Do("PING") //做活性测试 PING
 			return err
 		},
 	}

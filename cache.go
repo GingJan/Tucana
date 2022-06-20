@@ -53,11 +53,9 @@ type tCache struct {
 	fetcher fetchFunc
 	watchC  chan alteration //key值变动的通知channel
 	sf      singleflight.Group
-
-	tag string
 }
 
-func New(tag string, a ...interface{}) *tCache {
+func New() *tCache {
 	if mgr == nil {
 		panic("Init first")
 	}
@@ -70,7 +68,9 @@ func New(tag string, a ...interface{}) *tCache {
 		},
 		m:          mgr.manager,
 		localCache: localCache.New(1*time.Minute, 5*time.Minute),
+		fetcher:    nil,
 		watchC:     make(chan alteration, 10),
+		sf:         singleflight.Group{},
 	}
 
 	go tc.watch()
@@ -113,7 +113,7 @@ func (t *tCache) store(key string, bdata []byte, layer int) error {
 		t.setLocal(key, bdata, expireIn)
 		return nil
 	case layerRemote:
-		//just one shot, ignore it if failed
+		//just one shot, ignore if it's failed
 		_, err := t.setRemote(key, bdata, expireIn, false)
 		return err
 	case layerLocal | layerRemote:
@@ -253,8 +253,9 @@ func (t *tCache) getLocal(key string) ([]byte, bool) {
 		if t.isNil(data.([]byte)) {
 			return nil, false
 		}
+		return data.([]byte), true
 	}
-	return data.([]byte), true
+	return nil, false
 }
 
 // setting remote cache
@@ -331,15 +332,9 @@ func (t *tCache) IsNil(raw interface{}) bool {
 	return t.isNil(raw)
 }
 
-func (t *tCache) Update(ctx context.Context, key string, f CacheUpdateFunc) error {
-	//执行f
-	_, err := f(ctx)
-	if err != nil {
-		return err
-	}
-
+func (t *tCache) Update(ctx context.Context, tag string, argus ...interface{}) error {
 	//notify key to update
-	return t.m.NotifyUpdating(key)
+	return t.m.NotifyUpdating(fmt.Sprintf(tag, argus...))
 }
 
 func (t *tCache) Store(key string, bdata []byte) error {
@@ -376,10 +371,10 @@ func (t *tCache) GetOrFetch(key string, fetcher fetchFunc, expireIn time.Duratio
 	return data, true, nil
 }
 
-func (t *tCache) Get(argus ...interface{}) *tagCache {
+func (t *tCache) Get(tag string, argus ...interface{}) *tagCache {
 	return &tagCache{
 		l:   fromCache,
-		key: fmt.Sprintf(t.tag, argus...),
+		key: fmt.Sprintf(tag, argus...),
 		t:   t,
 	}
 }
@@ -404,10 +399,10 @@ type tagCache struct {
 	key string
 }
 
-func (tc *tagCache) Get(argus ...interface{}) *tagCache {
+func (tc *tagCache) Get(tag string, argus ...interface{}) *tagCache {
 	tc.l |= fromCache
 	if len(argus) != 0 {
-		tc.key = fmt.Sprintf(tc.t.tag, argus...)
+		tc.key = fmt.Sprintf(tag, argus...)
 	}
 
 	return tc
@@ -419,9 +414,9 @@ func (tc *tagCache) OrFetch(fetcher fetchFunc) *tagCache {
 	return tc
 }
 
-func (tc *tagCache) Do(argus ...interface{}) ([]byte, bool, error) {
+func (tc *tagCache) Do(tag string, argus ...interface{}) ([]byte, bool, error) {
 	if len(argus) != 0 {
-		tc.key = fmt.Sprintf(tc.t.tag, argus...)
+		tc.key = fmt.Sprintf(tag, argus...)
 	}
 
 	if !tc.isValidKey() {
