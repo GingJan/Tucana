@@ -414,12 +414,8 @@ func (tc *tagCache) OrFetch(fetcher fetchFunc) *tagCache {
 	return tc
 }
 
-func (tc *tagCache) Do(tag string, argus ...interface{}) ([]byte, bool, error) {
-	if len(argus) != 0 {
-		tc.key = fmt.Sprintf(tag, argus...)
-	}
-
-	if !tc.isValidKey() {
+func (tc *tagCache) Do() ([]byte, bool, error) {
+	if tc.isInvalidKey() {
 		return []byte{}, false, fmt.Errorf("key empty")
 	}
 
@@ -474,6 +470,6 @@ func (tc *tagCache) get() ([]byte, bool, error) {
 	return []byte{}, false, nil
 }
 
-func (tc *tagCache) isValidKey() bool {
-	return len(tc.key) != 0
+func (tc *tagCache) isInvalidKey() bool {
+	return len(tc.key) == 0
 }
